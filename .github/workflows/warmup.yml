@@ -2,7 +2,12 @@ name: Claude Code Warmup
 
 on:
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '*/5 5-7 * * *'
+      timezone: 'Asia/Shanghai'
+    - cron: '*/5 10-12 * * *'
+      timezone: 'Asia/Shanghai'
+    - cron: '*/5 15-17 * * *'
+      timezone: 'Asia/Shanghai'
   workflow_dispatch: {}
 
 concurrency:
@@ -12,22 +17,92 @@ concurrency:
 jobs:
   warmup:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
+    env:
+      TZ: Asia/Shanghai
+      # 每条 cron 对应一个目标小时：5-7→7，10-12→12，15-17→17
+      EARLY_MINUTES: '5'
+      STATE_FILE: ${{ github.workspace }}/.warmup-state
     steps:
+      - name: Restore slot state
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.warmup-state
+          key: warmup-slots-${{ github.run_id }}
+          restore-keys: |
+            warmup-slots-
+
+      - name: Gate
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+
+          today=$(date +%F)
+          now_min=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+          touch "${STATE_FILE}"
+
+          echo "now=$(date '+%F %T %Z')"
+          echo "event=${EVENT_NAME}"
+          echo "schedule_cron=${SCHEDULE_CRON:-}"
+
+          target=""
+          case "${SCHEDULE_CRON:-}" in
+            '*/5 5-7 * * *')   target=7 ;;
+            '*/5 10-12 * * *') target=12 ;;
+            '*/5 15-17 * * *') target=17 ;;
+          esac
+
+          if [[ -z "${target}" ]]; then
+            if   (( now_min >= 17 * 60 )); then target=17
+            elif (( now_min >= 12 * 60 )); then target=12
+            else target=7
+            fi
+          fi
+
+          slot_key="${today}:${target}"
+          open_min=$((target * 60 - EARLY_MINUTES))
+          (( open_min < 0 )) && open_min=0
+
+          echo "slot=${slot_key}"
+
+          if grep -qxF "${slot_key}" "${STATE_FILE}"; then
+            should_run=false
+            reason="round ${target}:00 already done — skip later tickets"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            should_run=true
+            reason="manual dispatch for ${target}:00"
+          elif (( now_min < open_min )); then
+            should_run=false
+            reason="before ${target}:00 ($(date +%H:%M)) — wait"
+          else
+            should_run=true
+            reason="first ticket at/past ${target}:00 — run"
+          fi
+
+          echo "decision=${should_run}  (${reason})"
+          echo "should_run=${should_run}" >> "${GITHUB_OUTPUT}"
+          echo "slot_key=${slot_key}" >> "${GITHUB_OUTPUT}"
+
       - name: Validate configuration
+        if: steps.gate.outputs.should_run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
         run: |
           if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
             echo "CLAUDE_OAUTH_TOKEN secret is not set."
-            echo "Add it in Settings > Secrets and variables > Actions."
             exit 1
           fi
 
       - name: Install Claude Code
+        if: steps.gate.outputs.should_run == 'true'
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Ping Claude to anchor 5-hour window
+      - name: Ping Claude
+        if: steps.gate.outputs.should_run == 'true'
+        id: ping
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
         run: |
@@ -40,23 +115,23 @@ jobs:
           set -e
           cat "$output_file"
 
-          if [ $status -eq 0 ]; then
-            echo "Claude warmup request succeeded."
+          if [ $status -eq 0 ] || grep -qi "rate limit" "$output_file"; then
+            echo "ok=true" >> "${GITHUB_OUTPUT}"
             echo "✓ Warmup complete"
             exit 0
           fi
-
+          echo "ok=false" >> "${GITHUB_OUTPUT}"
           if grep -Eiq "expired|unauthorized|invalid token|authentication|auth failed|login required|not logged in" "$output_file"; then
             echo "Claude token appears invalid or expired."
-            echo "Run 'claude setup-token' locally and update the CLAUDE_OAUTH_TOKEN GitHub secret."
             exit 1
           fi
-
-          if grep -qi "rate limit" "$output_file"; then
-            echo "Claude reported a rate limit; treating as warmup success."
-            echo "✓ Warmup complete"
-            exit 0
-          fi
-
           echo "Claude warmup failed with an unexpected error."
           exit $status
+
+      - name: Mark round done
+        if: steps.gate.outputs.should_run == 'true' && steps.ping.outputs.ok == 'true'
+        run: |
+          slot_key='${{ steps.gate.outputs.slot_key }}'
+          grep -qxF "${slot_key}" "${STATE_FILE}" 2>/dev/null || echo "${slot_key}" >> "${STATE_FILE}"
+          echo "marked ${slot_key}"
+          cat "${STATE_FILE}"
