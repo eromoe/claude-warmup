@@ -2,11 +2,11 @@ name: Claude Code Warmup
 
 on:
   schedule:
-    - cron: '3-58/5 4-6 * * *'
+    - cron: '3-58/5 4-7 * * *'
       timezone: 'Asia/Shanghai'
-    - cron: '3-58/5 9-11 * * *'
+    - cron: '3-58/5 9-12 * * *'
       timezone: 'Asia/Shanghai'
-    - cron: '3-58/5 14-16 * * *'
+    - cron: '3-58/5 14-17 * * *'
       timezone: 'Asia/Shanghai'
   repository_dispatch:
     types: [warmup]
@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: claude-warmup
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   warmup:
@@ -22,8 +22,9 @@ jobs:
     timeout-minutes: 10
     env:
       TZ: Asia/Shanghai
-      # 每条 cron 对应一个目标小时：4-6→6，9-11→11，14-16→16
-      EARLY_MINUTES: '5'
+      # 名义班次（分钟）：6:25=385，11:28=688，16:31=991；链式空隙 BUF，宽容期 GRACE
+      BUF_MIN: '2'
+      GRACE_MIN: '120'
       STATE_FILE: ${{ github.workspace }}/.warmup-state
     steps:
       - name: Restore slot state
@@ -39,56 +40,58 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_CRON: ${{ github.event.schedule }}
-          CLIENT_PAYLOAD_TARGET: ${{ github.event.client_payload.target }}
         run: |
           set -euo pipefail
 
           today=$(date +%F)
           now_min=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+          now_epoch=$(date +%s)
           touch "${STATE_FILE}"
 
           echo "now=$(date '+%F %T %Z')"
           echo "event=${EVENT_NAME}"
           echo "schedule_cron=${SCHEDULE_CRON:-}"
 
-          target=""
-          case "${SCHEDULE_CRON:-}" in
-            '3-58/5 4-6 * * *')   target=6 ;;
-            '3-58/5 9-11 * * *')  target=11 ;;
-            '3-58/5 14-16 * * *') target=16 ;;
-          esac
-
-          if [[ -z "${target}" ]] && [[ "${CLIENT_PAYLOAD_TARGET:-}" =~ ^(6|11|16)$ ]]; then
-            target="${CLIENT_PAYLOAD_TARGET}"
+          WINDOW_MIN=300
+          nominal=""
+          if   (( now_min >= 991 )); then nominal=991
+          elif (( now_min >= 688 )); then nominal=688
+          elif (( now_min >= 385 )); then nominal=385
           fi
 
-          if [[ -z "${target}" ]]; then
-            if   (( now_min >= 805 )); then target=16
-            elif (( now_min >= 505 )); then target=11
-            else target=6
-            fi
+          last_epoch=""
+          if grep -q '^last=' "${STATE_FILE}"; then
+            last_epoch=$(sed -n 's/^last=//p' "${STATE_FILE}" | tail -n 1)
           fi
 
-          slot_key="${today}:${target}"
-          open_min=$((target * 60 - EARLY_MINUTES))
-          (( open_min < 0 )) && open_min=0
+          slot_key="${today}:${nominal:-manual}"
+          printf -v nominal_hm '%02d:%02d' $(( ${nominal:-0} / 60 )) $(( ${nominal:-0} % 60 ))
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            should_run=true
+            reason="manual dispatch — run"
+          elif [[ -z "${nominal}" ]]; then
+            should_run=false
+            reason="before 06:25 — outside anchor windows"
+          elif grep -qxF "${slot_key}" "${STATE_FILE}"; then
+            should_run=false
+            reason="slot ${nominal_hm} already anchored — skip"
+          elif (( now_min > nominal + GRACE_MIN )); then
+            should_run=false
+            reason="past ${GRACE_MIN}min grace of ${nominal_hm} — skip"
+          elif [[ -z "${last_epoch}" ]]; then
+            should_run=true
+            reason="no previous anchor on record — run"
+          elif (( now_epoch - last_epoch >= (WINDOW_MIN + BUF_MIN) * 60 )); then
+            should_run=true
+            reason="previous window expired — run"
+          else
+            should_run=false
+            wait_min=$(( (WINDOW_MIN + BUF_MIN) * 60 - (now_epoch - last_epoch) ))
+            reason="previous window active ${wait_min}s more — skip"
+          fi
 
           echo "slot=${slot_key}"
-
-          if grep -qxF "${slot_key}" "${STATE_FILE}"; then
-            should_run=false
-            reason="round ${target}:00 already done — skip later tickets"
-          elif [[ "${EVENT_NAME}" == "workflow_dispatch" || "${EVENT_NAME}" == "repository_dispatch" ]]; then
-            should_run=true
-            reason="dispatch for ${target}:00"
-          elif (( now_min < open_min )); then
-            should_run=false
-            reason="before ${target}:00 ($(date +%H:%M)) — wait"
-          else
-            should_run=true
-            reason="first ticket at/past ${target}:00 — run"
-          fi
-
           echo "decision=${should_run}  (${reason})"
           echo "should_run=${should_run}" >> "${GITHUB_OUTPUT}"
           echo "slot_key=${slot_key}" >> "${GITHUB_OUTPUT}"
@@ -158,6 +161,12 @@ jobs:
         if: steps.gate.outputs.should_run == 'true' && steps.ping.outputs.ok == 'true'
         run: |
           slot_key='${{ steps.gate.outputs.slot_key }}'
+          now_epoch=$(date +%s)
+          today=$(date +%F)
           grep -qxF "${slot_key}" "${STATE_FILE}" 2>/dev/null || echo "${slot_key}" >> "${STATE_FILE}"
-          echo "marked ${slot_key}"
+          sed -i '/^last=/d' "${STATE_FILE}"
+          echo "last=${now_epoch}" >> "${STATE_FILE}"
+          grep -E "^last=|^${today}:" "${STATE_FILE}" > "${STATE_FILE}.tmp" || true
+          mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+          echo "marked ${slot_key} last=${now_epoch}"
           cat "${STATE_FILE}"
