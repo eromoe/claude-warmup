@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
     env:
       TZ: Asia/Shanghai
-      # 每条 cron 对应一个目标时刻（分钟数）：4-6→6:30(390)，9-11→11:30(690)，14-16→16:30(990)
+      # 每条 cron 对应一个目标小时：4-6→6，9-11→11，14-16→16
       EARLY_MINUTES: '5'
       STATE_FILE: ${{ github.workspace }}/.warmup-state
     steps:
@@ -51,43 +51,42 @@ jobs:
           echo "event=${EVENT_NAME}"
           echo "schedule_cron=${SCHEDULE_CRON:-}"
 
-          target_min=""
+          target=""
           case "${SCHEDULE_CRON:-}" in
-            '3-58/5 4-6 * * *')   target_min=390 ;;
-            '3-58/5 9-11 * * *')  target_min=690 ;;
-            '3-58/5 14-16 * * *') target_min=990 ;;
+            '3-58/5 4-6 * * *')   target=6 ;;
+            '3-58/5 9-11 * * *')  target=11 ;;
+            '3-58/5 14-16 * * *') target=16 ;;
           esac
 
-          if [[ -z "${target_min}" ]] && [[ "${CLIENT_PAYLOAD_TARGET:-}" =~ ^(6|11|16)$ ]]; then
-            target_min=$(( CLIENT_PAYLOAD_TARGET * 60 + 30 ))
+          if [[ -z "${target}" ]] && [[ "${CLIENT_PAYLOAD_TARGET:-}" =~ ^(6|11|16)$ ]]; then
+            target="${CLIENT_PAYLOAD_TARGET}"
           fi
 
-          if [[ -z "${target_min}" ]]; then
-            if   (( now_min >= 835 )); then target_min=990
-            elif (( now_min >= 535 )); then target_min=690
-            else target_min=390
+          if [[ -z "${target}" ]]; then
+            if   (( now_min >= 805 )); then target=16
+            elif (( now_min >= 505 )); then target=11
+            else target=6
             fi
           fi
 
-          slot_key="${today}:${target_min}"
-          open_min=$((target_min - EARLY_MINUTES))
+          slot_key="${today}:${target}"
+          open_min=$((target * 60 - EARLY_MINUTES))
           (( open_min < 0 )) && open_min=0
-          printf -v target_hm '%02d:%02d' $((target_min / 60)) $((target_min % 60))
 
           echo "slot=${slot_key}"
 
           if grep -qxF "${slot_key}" "${STATE_FILE}"; then
             should_run=false
-            reason="round ${target_hm} already done — skip later tickets"
+            reason="round ${target}:00 already done — skip later tickets"
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" || "${EVENT_NAME}" == "repository_dispatch" ]]; then
             should_run=true
-            reason="dispatch for ${target_hm}"
+            reason="dispatch for ${target}:00"
           elif (( now_min < open_min )); then
             should_run=false
-            reason="before ${target_hm} ($(date +%H:%M)) — wait"
+            reason="before ${target}:00 ($(date +%H:%M)) — wait"
           else
             should_run=true
-            reason="first ticket at/past ${target_hm} — run"
+            reason="first ticket at/past ${target}:00 — run"
           fi
 
           echo "decision=${should_run}  (${reason})"
