@@ -2,12 +2,14 @@ name: Claude Code Warmup
 
 on:
   schedule:
-    - cron: '*/5 5-7 * * *'
+    - cron: '3-58/5 4-6 * * *'
       timezone: 'Asia/Shanghai'
-    - cron: '*/5 10-12 * * *'
+    - cron: '3-58/5 9-11 * * *'
       timezone: 'Asia/Shanghai'
-    - cron: '*/5 15-17 * * *'
+    - cron: '3-58/5 14-16 * * *'
       timezone: 'Asia/Shanghai'
+  repository_dispatch:
+    types: [warmup]
   workflow_dispatch: {}
 
 concurrency:
@@ -17,10 +19,10 @@ concurrency:
 jobs:
   warmup:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
     env:
       TZ: Asia/Shanghai
-      # 每条 cron 对应一个目标小时：5-7→7，10-12→12，15-17→17
+      # 每条 cron 对应一个目标小时：4-6→6，9-11→11，14-16→16
       EARLY_MINUTES: '5'
       STATE_FILE: ${{ github.workspace }}/.warmup-state
     steps:
@@ -37,6 +39,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_CRON: ${{ github.event.schedule }}
+          CLIENT_PAYLOAD_TARGET: ${{ github.event.client_payload.target }}
         run: |
           set -euo pipefail
 
@@ -50,15 +53,19 @@ jobs:
 
           target=""
           case "${SCHEDULE_CRON:-}" in
-            '*/5 5-7 * * *')   target=7 ;;
-            '*/5 10-12 * * *') target=12 ;;
-            '*/5 15-17 * * *') target=17 ;;
+            '3-58/5 4-6 * * *')   target=6 ;;
+            '3-58/5 9-11 * * *')  target=11 ;;
+            '3-58/5 14-16 * * *') target=16 ;;
           esac
 
+          if [[ -z "${target}" ]] && [[ "${CLIENT_PAYLOAD_TARGET:-}" =~ ^(6|11|16)$ ]]; then
+            target="${CLIENT_PAYLOAD_TARGET}"
+          fi
+
           if [[ -z "${target}" ]]; then
-            if   (( now_min >= 17 * 60 )); then target=17
-            elif (( now_min >= 12 * 60 )); then target=12
-            else target=7
+            if   (( now_min >= 805 )); then target=16
+            elif (( now_min >= 505 )); then target=11
+            else target=6
             fi
           fi
 
@@ -71,9 +78,9 @@ jobs:
           if grep -qxF "${slot_key}" "${STATE_FILE}"; then
             should_run=false
             reason="round ${target}:00 already done — skip later tickets"
-          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" || "${EVENT_NAME}" == "repository_dispatch" ]]; then
             should_run=true
-            reason="manual dispatch for ${target}:00"
+            reason="dispatch for ${target}:00"
           elif (( now_min < open_min )); then
             should_run=false
             reason="before ${target}:00 ($(date +%H:%M)) — wait"
@@ -109,23 +116,42 @@ jobs:
           mkdir -p ~/.claude
           echo '{"hasCompletedOnboarding":true}' > ~/.claude.json
           output_file="$(mktemp)"
-          set +e
-          claude -p "hi" --model haiku --no-session-persistence >"$output_file" 2>&1
-          status=$?
-          set -e
-          cat "$output_file"
 
-          if [ $status -eq 0 ] || grep -qi "rate limit" "$output_file"; then
-            echo "ok=true" >> "${GITHUB_OUTPUT}"
-            echo "✓ Warmup complete"
-            exit 0
-          fi
+          max_attempts=10
+          retry_delay=30
+          attempt=1
+
+          while true; do
+            set +e
+            claude -p "hi" --model haiku --no-session-persistence >"$output_file" 2>&1
+            status=$?
+            set -e
+            echo "--- ping attempt ${attempt}/${max_attempts} (exit ${status}) ---"
+            cat "$output_file"
+
+            if [ $status -eq 0 ] || grep -qi "rate limit" "$output_file"; then
+              echo "ok=true" >> "${GITHUB_OUTPUT}"
+              echo "✓ Warmup complete"
+              exit 0
+            fi
+
+            if grep -Eiq "expired|unauthorized|invalid token|authentication|auth failed|login required|not logged in" "$output_file"; then
+              echo "ok=false" >> "${GITHUB_OUTPUT}"
+              echo "Claude token appears invalid or expired — no retry."
+              exit 1
+            fi
+
+            if [ $attempt -ge $max_attempts ]; then
+              break
+            fi
+
+            echo "attempt ${attempt} failed — retrying in ${retry_delay}s"
+            sleep $retry_delay
+            attempt=$((attempt + 1))
+          done
+
           echo "ok=false" >> "${GITHUB_OUTPUT}"
-          if grep -Eiq "expired|unauthorized|invalid token|authentication|auth failed|login required|not logged in" "$output_file"; then
-            echo "Claude token appears invalid or expired."
-            exit 1
-          fi
-          echo "Claude warmup failed with an unexpected error."
+          echo "Claude warmup failed after ${max_attempts} attempts."
           exit $status
 
       - name: Mark round done
